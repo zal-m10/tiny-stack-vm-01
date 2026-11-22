@@ -1,7 +1,7 @@
-# tiny-stack-vm
+# Tiny stack VM
 
-A faithful interpreter of make.fun's tiny stack ISA, for
-tiny-stack-vm-01-run-20261122. Run as `node /bot/main.ts` (Node 22): it runs
-each `/input/<id>/program.bin` on its `input.bin` and writes
-`/output/<id>/stdout.bin` and `/output/<id>/exit.txt`, following the kit's
-reference VM exactly.
+A faithful interpreter of make.fun's tiny stack ISA (version 1). For every
+instance `<id>` in `$MAKEFUN_INPUT_DIR` it reads `{program,input}.bin` and
+writes `{stdout.bin,exit.txt}` under `$MAKEFUN_OUTPUT_DIR/<id>`.
+
+Run with Node 22: `node main.ts`. No dependencies.

@@ -1,192 +1,155 @@
-// tiny-stack-vm: a faithful interpreter of make.fun's tiny stack ISA (ISA.md).
-// Run as `node /bot/main.ts` (Node 22): reads $MAKEFUN_INPUT_DIR/<id>/program.bin
-// and input.bin, writes $MAKEFUN_OUTPUT_DIR/<id>/stdout.bin and exit.txt. Each step
-// checks, in order: step limit (10), pc bounds (9), opcode (5), immediate
-// fitting (9), stack pops/pushes (2/3), then the instruction's own traps.
-// A trap ends the program at once with the trap's code, keeping earlier output.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Faithful interpreter of make.fun's tiny stack ISA (version 1).
+// Reads every $MAKEFUN_INPUT_DIR/<id>/{program,input}.bin and writes
+// $MAKEFUN_OUTPUT_DIR/<id>/{stdout.bin,exit.txt}. Deterministic; the whole
+// set runs in well under 60 s. See ISA.md in the kit for the rules.
+import {mkdirSync, readFileSync, readdirSync, writeFileSync} from 'node:fs';
+import {join} from 'node:path';
 
-const T_UNDERFLOW = 2, T_OVERFLOW = 3, T_DIV_ZERO = 4, T_BAD_OPCODE = 5;
-const T_MEMORY = 6, T_CALL_DEPTH = 7, T_RET_EMPTY = 8, T_PC = 9;
-const T_STEPS = 10, T_OUTPUT = 11;
+const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR || '/input';
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+const text = new TextEncoder();
 
-// [byte, imm, pops, pushes] x38 (byte in decimal).
-const OPS: number[] = [
-  0, 0, 0, 0, 1, 1, 0, 1, 2, 4, 0, 1, 3, 0, 1, 0, 4, 0, 1, 2, 5, 0, 2, 2, 6, 0, 2, 3, 7, 0, 3, 3,
-  16, 0, 2, 1, 17, 0, 2, 1, 18, 0, 2, 1, 19, 0, 2, 1, 20, 0, 2, 1, 21, 0, 2, 1, 22, 0, 2, 1, 23, 0, 1, 1,
-  24, 0, 2, 1, 25, 0, 2, 1, 26, 0, 2, 1, 27, 0, 1, 1, 28, 0, 2, 1, 29, 0, 2, 1, 30, 0, 2, 1, 32, 0, 2, 1,
-  33, 0, 2, 1, 34, 0, 2, 1, 48, 2, 0, 0, 49, 2, 1, 0, 50, 2, 1, 0, 51, 2, 0, 0, 52, 0, 0, 0, 64, 0, 1, 1,
-  65, 0, 2, 0, 80, 0, 1, 0, 81, 0, 1, 0, 82, 0, 0, 1, 83, 0, 1, 0,
-];
+// Opcode metadata: [immediate bytes, values popped, values pushed].
+// null means the byte names no opcode (trap 5). The two small tables are
+// built once here, not on every executed step (up to 1,000,000 per instance).
+const SMALL = [[0, 0, 0], [1, 0, 1], [4, 0, 1], [0, 1, 0], [0, 1, 2], [0, 2, 2], [0, 2, 3], [0, 3, 3]];
+const JUMPS = [[2, 0, 0], [2, 1, 0], [2, 1, 0], [2, 0, 0], [0, 0, 0]];
+function meta(op) {
+  if (op < 8) return SMALL[op];
+  if (op >= 16 && op <= 34) return op === 23 || op === 27 ? [0, 1, 1] : [0, 2, 1];
+  if (op >= 48 && op <= 52) return JUMPS[op - 48];
+  if (op === 64) return [0, 1, 1];
+  if (op === 65) return [0, 2, 0];
+  if (op === 80 || op === 81) return [0, 1, 0];
+  if (op === 82) return [0, 0, 1];
+  if (op === 83) return [0, 1, 0];
+  return null;
+}
 
-// Opcode -> [imm, pops, pushes].
-const OP_BY_BYTE: ([number, number, number] | undefined)[] = new Array(256).fill(undefined);
-for (let i = 0; i < OPS.length; i += 4) OP_BY_BYTE[OPS[i]] = [OPS[i + 1], OPS[i + 2], OPS[i + 3]];
-
-const enc = new TextEncoder();
-
-function run(program: Uint8Array, input: Uint8Array): { out: Uint8Array; exit: number } {
-  const n = program.length;
-  const D = new Int32Array(256);
-  let sp = 0;
-  const C = new Int32Array(64);
-  let csp = 0;
-  const M = new Int32Array(256);
+// Runs one program on its input. Returns {o: bytes written, e: exit code}.
+function run(prog, input) {
+  const n = prog.length;
+  const S = new Int32Array(256); // data stack
+  const C = new Int32Array(64); // call stack
+  const M = new Int32Array(256); // memory
   const out = new Uint8Array(65536);
-  let olen = 0, inPos = 0, pc = 0, steps = 0;
-  const done = (exit: number) => ({ out: out.slice(0, olen), exit });
+  let sp = 0, cp = 0, ol = 0, ip = 0, pc = 0, steps = 0;
+  const done = (exit) => ({o: out.slice(0, ol), e: exit});
   for (;;) {
-    if (steps === 1e6) return done(T_STEPS);
-    if (pc < 0 || pc >= n) return done(T_PC);
-    const oc = program[pc];
-    const op = OP_BY_BYTE[oc];
-    if (op === undefined) return done(T_BAD_OPCODE);
-    const [imm, pops, pushes] = op;
-    if (pc + imm >= n) return done(T_PC);
+    if (steps === 1000000) return done(10); // step limit
+    if (pc < 0 || pc >= n) return done(9); // pc outside the program
+    const m = meta(prog[pc]);
+    if (!m) return done(5); // unknown opcode
+    const [imm, pops, pushes] = m;
+    if (pc + imm >= n) return done(9); // immediate cut off by the end
     steps++;
-    const next = pc + 1 + imm;
-    if (sp < pops) return done(T_UNDERFLOW);
-    if (sp - pops + pushes > 256) return done(T_OVERFLOW);
-    pc = next;
-    switch (oc) {
-      case 0x00:
-        return done(0);
-      case 0x01:
-        D[sp++] = (program[next - 1] << 24) >> 24;
-        break;
-      case 0x02:
-        D[sp++] = program[next - 4] | (program[next - 3] << 8) | (program[next - 2] << 16) | (program[next - 1] << 24);
-        break;
-      case 0x03:
-        sp--;
-        break;
-      case 0x04:
-        D[sp] = D[sp - 1];
-        sp++;
-        break;
-      case 0x05: {
-        const t = D[sp - 1];
-        D[sp - 1] = D[sp - 2];
-        D[sp - 2] = t;
+    if (sp < pops) return done(2); // stack underflow
+    if (sp - pops + pushes > 256) return done(3); // stack overflow
+    const p = pc, op = prog[p];
+    pc = p + 1 + imm; // address of the next instruction
+    // Two-operand arithmetic and logic (0x10-0x22 except unary NEG/NOT).
+    if (op >= 16 && op <= 34 && op !== 23 && op !== 27) {
+      const b = S[sp - 1], a = S[sp - 2];
+      let r;
+      switch (op) {
+        case 16: r = (a + b) | 0; break; // ADD, wraps
+        case 17: r = (a - b) | 0; break; // SUB, wraps
+        case 18: r = Math.imul(a, b); break; // MUL, low 32 bits of the exact product
+        case 19: // DIV, truncates toward zero
+          if (!b) return done(4);
+          r = a === -2147483648 && b === -1 ? a : (a / b) | 0;
+          break;
+        case 20: // MOD, sign of a
+          if (!b) return done(4);
+          r = b === -1 ? 0 : a % b | 0;
+          break;
+        case 21: // DIVU, unsigned
+          if (!b) return done(4);
+          r = Math.floor((a >>> 0) / (b >>> 0)) | 0;
+          break;
+        case 22: // MODU, unsigned
+          if (!b) return done(4);
+          r = (a >>> 0) % (b >>> 0) | 0;
+          break;
+        case 24: r = a & b; break; // AND
+        case 25: r = a | b; break; // OR
+        case 26: r = a ^ b; break; // XOR
+        case 28: r = a << (b & 31); break; // SHL
+        case 29: r = a >> (b & 31); break; // SHR, arithmetic
+        case 30: r = (a >>> (b & 31)) | 0; break; // SHRU, logical
+        case 32: r = a === b ? 1 : 0; break; // EQ
+        case 33: r = a < b ? 1 : 0; break; // LT, signed
+        case 34: r = (a >>> 0) < (b >>> 0) ? 1 : 0; break; // LTU, unsigned
+      }
+      sp -= 2;
+      S[sp++] = r;
+      continue;
+    }
+    switch (op) {
+      case 0: return done(0); // HALT
+      case 1: S[sp++] = (prog[p + 1] << 24) >> 24; break; // PUSH8, sign-extended
+      case 2: S[sp++] = prog[p + 1] | prog[p + 2] << 8 | prog[p + 3] << 16 | prog[p + 4] << 24; break; // PUSH32
+      case 3: sp--; break; // POP
+      case 4: S[sp] = S[sp - 1]; sp++; break; // DUP
+      case 5: { const t = S[sp - 1]; S[sp - 1] = S[sp - 2]; S[sp - 2] = t; break; } // SWAP
+      case 6: S[sp] = S[sp - 2]; sp++; break; // OVER
+      case 7: { const a = S[sp - 3]; S[sp - 3] = S[sp - 2]; S[sp - 2] = S[sp - 1]; S[sp - 1] = a; break; } // ROT
+      case 23: S[sp - 1] = -S[sp - 1] | 0; break; // NEG, wraps at -2147483648
+      case 27: S[sp - 1] = ~S[sp - 1]; break; // NOT
+      case 48: case 49: case 50: { // JMP, JZ, JNZ
+        const rel = ((prog[p + 1] | prog[p + 2] << 8) << 16) >> 16;
+        if (op === 48) { pc += rel; break; }
+        const v = S[--sp];
+        if ((op === 49 && v === 0) || (op === 50 && v !== 0)) pc += rel;
         break;
       }
-      case 0x06:
-        D[sp] = D[sp - 2];
-        sp++;
+      case 51: // CALL
+        if (cp === 64) return done(7);
+        C[cp++] = pc;
+        pc = prog[p + 1] | prog[p + 2] << 8;
         break;
-      case 0x07: {
-        const a = D[sp - 3];
-        D[sp - 3] = D[sp - 2];
-        D[sp - 2] = D[sp - 1];
-        D[sp - 1] = a;
+      case 52: // RET
+        if (cp === 0) return done(8);
+        pc = C[--cp];
+        break;
+      case 64: { // LOAD
+        const a = S[sp - 1];
+        if (a < 0 || a >= 256) return done(6);
+        S[sp - 1] = M[a];
         break;
       }
-      case 0x17:
-        D[sp - 1] = -D[sp - 1] | 0;
-        break;
-      case 0x1b:
-        D[sp - 1] = ~D[sp - 1];
-        break;
-      case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
-      case 0x16: case 0x18: case 0x19: case 0x1a: case 0x1c: case 0x1d:
-      case 0x1e: case 0x20: case 0x21: case 0x22: {
-        const b = D[sp - 1];
-        const a = D[sp - 2];
-        let r: number;
-        switch (oc) {
-          case 0x10: r = (a + b) | 0; break;
-          case 0x11: r = (a - b) | 0; break;
-          case 0x12: r = Math.imul(a, b); break; // exact low 32 bits
-          case 0x13:
-            if (b === 0) return done(T_DIV_ZERO);
-            r = a === -2147483648 && b === -1 ? a : (a / b) | 0;
-            break;
-          case 0x14:
-            if (b === 0) return done(T_DIV_ZERO);
-            r = b === -1 ? 0 : (a % b) | 0;
-            break;
-          case 0x15:
-            if (b === 0) return done(T_DIV_ZERO);
-            r = Math.floor((a >>> 0) / (b >>> 0)) | 0;
-            break;
-          case 0x16:
-            if (b === 0) return done(T_DIV_ZERO);
-            r = ((a >>> 0) % (b >>> 0)) | 0;
-            break;
-          case 0x18: r = a & b; break;
-          case 0x19: r = a | b; break;
-          case 0x1a: r = a ^ b; break;
-          case 0x1c: r = a << (b & 31); break;
-          case 0x1d: r = a >> (b & 31); break;
-          case 0x1e: r = (a >>> (b & 31)) | 0; break;
-          case 0x20: r = a === b ? 1 : 0; break;
-          case 0x21: r = a < b ? 1 : 0; break;
-          default: r = (a >>> 0) < (b >>> 0) ? 1 : 0; break;
-        }
+      case 65: { // STORE
+        const a = S[sp - 1], v = S[sp - 2];
+        if (a < 0 || a >= 256) return done(6);
         sp -= 2;
-        D[sp++] = r;
+        M[a] = v;
         break;
       }
-      case 0x30: case 0x31: case 0x32: {
-        const rel = ((program[next - 2] | (program[next - 1] << 8)) << 16) >> 16;
-        let take = true;
-        if (oc !== 0x30) {
-          const v = D[--sp];
-          take = oc === 0x31 ? v === 0 : v !== 0;
-        }
-        if (take) pc = next + rel;
-        break;
-      }
-      case 0x33:
-        if (csp === 64) return done(T_CALL_DEPTH);
-        C[csp++] = next;
-        pc = program[next - 2] | (program[next - 1] << 8);
-        break;
-      case 0x34:
-        if (csp === 0) return done(T_RET_EMPTY);
-        pc = C[--csp];
-        break;
-      case 0x40: {
-        const addr = D[sp - 1];
-        if (addr < 0 || addr >= 256) return done(T_MEMORY);
-        D[sp - 1] = M[addr];
-        break;
-      }
-      case 0x41: {
-        const addr = D[sp - 1];
-        const v = D[sp - 2];
-        if (addr < 0 || addr >= 256) return done(T_MEMORY);
-        sp -= 2;
-        M[addr] = v;
-        break;
-      }
-      case 0x50: {
-        const bytes = enc.encode(String(D[sp - 1]));
-        if (olen + bytes.length > 65536) return done(T_OUTPUT);
+      case 80: { // PRINT, decimal ASCII
+        const t = text.encode(String(S[sp - 1]));
+        if (ol + t.length > 65536) return done(11);
         sp--;
-        out.set(bytes, olen);
-        olen += bytes.length;
+        out.set(t, ol);
+        ol += t.length;
         break;
       }
-      case 0x51:
-        if (olen + 1 > 65536) return done(T_OUTPUT);
-        out[olen++] = D[--sp] & 255;
+      case 81: // PUTC, one byte
+        if (ol + 1 > 65536) return done(11);
+        out[ol++] = S[--sp] & 255;
         break;
-      case 0x52:
-        D[sp++] = inPos < input.length ? input[inPos++] : -1;
-        break;
-      case 0x53:
-        return done(D[--sp] & 255);
+      case 82: S[sp++] = ip < input.length ? input[ip++] : -1; break; // IN, -1 after EOF
+      case 83: return done(S[--sp] & 255); // EXIT, low byte of the code
     }
   }
 }
 
-const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-for (const id of readdirSync(I).sort()) {
-  const r = run(new Uint8Array(readFileSync(join(I, id, 'program.bin'))), new Uint8Array(readFileSync(join(I, id, 'input.bin'))));
-  mkdirSync(join(O, id), { recursive: true });
-  writeFileSync(join(O, id, 'stdout.bin'), r.out);
-  writeFileSync(join(O, id, 'exit.txt'), `${r.exit}\n`);
+// Answer every instance in the input directory.
+for (const id of readdirSync(INPUT_DIR).sort()) {
+  const prog = readFileSync(join(INPUT_DIR, id, 'program.bin'));
+  const input = readFileSync(join(INPUT_DIR, id, 'input.bin'));
+  const {o, e} = run(prog, input);
+  const dir = join(OUTPUT_DIR, id);
+  mkdirSync(dir, {recursive: true});
+  writeFileSync(join(dir, 'stdout.bin'), o);
+  writeFileSync(join(dir, 'exit.txt'), String(e) + '\n');
 }
